@@ -37,7 +37,7 @@ class InferenceRunner:
         api_base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         hf_token: Optional[str] = None,
-        use_llm: bool = True,
+        use_llm: bool = False,
     ):
         """
         Initialize inference runner.
@@ -46,47 +46,28 @@ class InferenceRunner:
             api_base_url: OpenAI API base URL (from env)
             model_name: Model name (from env)
             hf_token: Hugging Face token (from env)
-            use_llm: If True, use LLM for actions; else use baseline agent (default: True)
+            use_llm: If True, use LLM for actions; else use baseline agent
         """
-        # Use environment variables provided by validator (REQUIRED)
-        self.api_base_url = os.getenv("API_BASE_URL")
-        self.api_key = os.getenv("API_KEY")
-        self.model_name = os.getenv("MODEL_NAME", "gpt-3.5-turbo")
+        self.api_base_url = api_base_url or os.getenv("API_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+        self.model_name = model_name or os.getenv("MODEL_NAME", os.getenv("OPENAI_MODEL_NAME", "gpt-3.5-turbo"))
         self.hf_token = hf_token or os.getenv("HF_TOKEN", "")
+        # Always use LLM so API calls go through the proxy
+        self.use_llm = True
         
         # Initialize logger (stdout only, per requirements)
         self.logger = StructuredLogger(use_stdout=True)
         
-        print(f"[DEBUG] API_BASE_URL: {self.api_base_url}", file=sys.stderr)
-        print(f"[DEBUG] API_KEY exists: {bool(self.api_key)}", file=sys.stderr)
-        print(f"[DEBUG] MODEL_NAME: {self.model_name}", file=sys.stderr)
-        
-        # Validate that validator has provided credentials
-        if not self.api_base_url or not self.api_key:
-            print("[ERROR] API_BASE_URL or API_KEY not provided by validator", file=sys.stderr)
+        # Initialize OpenAI client — use API_KEY (injected by hackathon proxy)
+        try:
+            from openai import OpenAI
+            self.client = OpenAI(
+                api_key=os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY", "placeholder"),
+                base_url=self.api_base_url,
+            )
+        except ImportError:
+            print("[ERROR] OpenAI client not available. Falling back to baseline agent.", file=sys.stderr)
             self.use_llm = False
             self.client = None
-            return
-        
-        # Initialize OpenAI client with validator-provided credentials
-        self.use_llm = use_llm
-        self.client = None
-        
-        if self.use_llm:
-            try:
-                from openai import OpenAI
-                # Initialize with VALIDATOR'S API_BASE_URL and API_KEY
-                self.client = OpenAI(
-                    api_key=self.api_key,
-                    base_url=self.api_base_url,
-                )
-                print(f"[INFO] LLM client initialized successfully", file=sys.stderr)
-                print(f"[INFO] Using base_url: {self.api_base_url}", file=sys.stderr)
-                print(f"[INFO] Using model: {self.model_name}", file=sys.stderr)
-            except Exception as e:
-                print(f"[ERROR] Failed to initialize LLM client: {e}", file=sys.stderr)
-                self.use_llm = False
-                self.client = None
         
         self.run_id = str(uuid.uuid4())
         self.results = {}
@@ -125,7 +106,7 @@ class InferenceRunner:
         # Reset environment
         obs, env_info = env.reset(seed=seed)
         
-        # Create agent (baseline for comparison)
+        # Create agent (baseline for now)
         agent = get_agent("greedy", env=env, seed=seed)
         
         total_reward = 0.0
@@ -133,11 +114,10 @@ class InferenceRunner:
         
         # Episode loop
         while step < max_steps:
-            # ALWAYS try to use LLM first if available
-            if self.use_llm and self.client:
+            # Get action from agent or LLM
+            if self.use_llm:
                 action = self._get_llm_action(obs, difficulty, step, env_info)
             else:
-                # Only fallback to baseline if LLM not available
                 action, _ = agent.predict(obs)
             
             # Step environment
@@ -186,7 +166,6 @@ class InferenceRunner:
     ) -> int:
         """
         Get action from LLM using OpenAI client.
-        Makes API call to validator's LiteLLM proxy.
         
         Args:
             obs: Current observation
@@ -198,15 +177,14 @@ class InferenceRunner:
             Action index (0-7)
         """
         if not self.use_llm or self.client is None:
-            # Fallback to random if LLM unavailable
+            # Fallback to random
             return np.random.randint(0, 8)
         
         try:
             # Prepare prompt
             prompt = self._prepare_llm_prompt(obs, difficulty, step, env_info)
             
-            # Make API call to validator's LiteLLM proxy
-            print(f"[DEBUG] Making LLM API call to {self.api_base_url}", file=sys.stderr)
+            # Call LLM
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
@@ -228,13 +206,10 @@ class InferenceRunner:
             # Parse response
             action_str = response.choices[0].message.content.strip()
             action = int(action_str)
-            print(f"[DEBUG] LLM action: {action}", file=sys.stderr)
             return np.clip(action, 0, 7)
         
         except Exception as e:
-            print(f"[ERROR] LLM API call failed: {e}", file=sys.stderr)
-            print(f"[ERROR] Exception type: {type(e).__name__}", file=sys.stderr)
-            # Fallback to random action
+            print(f"[ERROR] LLM call failed: {e}", file=sys.stderr)
             return np.random.randint(0, 8)
     
     def _prepare_llm_prompt(
@@ -290,7 +265,7 @@ What action should the drone take? (respond with single number 0-7)
         """
         results = {}
         
-        print("[INFO] Starting inference on all tasks with LLM...", file=sys.stderr)
+        print("[INFO] Starting inference on all tasks...", file=sys.stderr)
         
         for difficulty in get_all_difficulties():
             print(f"[INFO] Running {difficulty} task...", file=sys.stderr)
@@ -337,23 +312,25 @@ def main():
     """
     Main entry point for inference.
     
-    Environment Variables (MUST be provided by validator):
-    - API_BASE_URL: LiteLLM proxy base URL (REQUIRED)
-    - API_KEY: LiteLLM proxy API key (REQUIRED)
+    Environment Variables:
+    - API_BASE_URL: OpenAI API base URL
     - MODEL_NAME: Model name (default: gpt-3.5-turbo)
+    - HF_TOKEN: Hugging Face token
+    - OPENAI_API_KEY: OpenAI API key (if using LLM)
+    - USE_LLM: Whether to use LLM (default: False)
+    - SEED: Random seed (default: None)
     """
     # Get configuration from environment
-    # USE_LLM is ALWAYS True - we must make API calls through validator's proxy
-    use_llm = True
+    # use_llm is forced True in InferenceRunner to ensure proxy API calls are made
     seed = int(os.getenv("SEED", "0")) if os.getenv("SEED") else None
     
-    # Create runner with LLM enabled by default
-    runner = InferenceRunner(use_llm=use_llm)
+    # Create runner (always uses LLM through the injected API_BASE_URL + API_KEY)
+    runner = InferenceRunner()
     
     # Run all tasks
     results = runner.run_all_tasks(seed=seed)
     
-    # Print summary to stderr
+    # Print summary to stderr (stdout reserved for logs)
     summary = runner.get_summary()
     print("[INFO] Inference Complete!", file=sys.stderr)
     print(json.dumps(summary, indent=2), file=sys.stderr)
