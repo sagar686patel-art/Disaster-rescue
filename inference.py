@@ -1,7 +1,7 @@
 """
 Mandatory Inference Script
 Implements required [START], [STEP], [END] logging protocol.
-FORCES OpenAI LLM API calls through validator's LiteLLM proxy.
+Uses OpenAI Client for LLM-based action selection.
 Supports all three difficulty levels: easy, medium, hard.
 """
 
@@ -19,6 +19,7 @@ from environment.disaster_env import DisasterRescueEnv
 from utils.logger import StructuredLogger, EpisodeLogger
 from utils.graders import get_grader
 from configs.task_config import get_all_difficulties
+from agents.baseline_agent import get_agent
 
 
 class InferenceRunner:
@@ -31,39 +32,52 @@ class InferenceRunner:
     [END] run_id=<uuid> task=<task_id> score=<float>
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        api_base_url: Optional[str] = None,
+        model_name: Optional[str] = None,
+        api_key: Optional[str] = None,
+        use_llm: bool = False,
+    ):
         """
         Initialize inference runner.
-        MUST use ONLY validator-provided API_BASE_URL and API_KEY.
+        
+        Args:
+            api_base_url: OpenAI API base URL (from env)
+            model_name: Model name (from env)
+            api_key: OpenAI API key (from env)
+            use_llm: If True, use LLM for actions; else use baseline agent
         """
-        # Read DIRECTLY from os.environ - NO fallbacks, NO defaults
-        api_base_url = os.environ["API_BASE_URL"]
-        api_key = os.environ["API_KEY"]
-        model_name = os.environ.get("MODEL_NAME", "gpt-3.5-turbo")
+        self.api_base_url = api_base_url or os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+        self.model_name = model_name or os.getenv("MODEL_NAME", "gpt-3.5-turbo")
+        self.api_key = api_key or os.getenv("API_KEY", "")
+        self.use_llm = use_llm
         
-        self.api_base_url = api_base_url
-        self.api_key = api_key
-        self.model_name = model_name
-        
-        # Initialize logger
-        self.logger = StructuredLogger(use_stdout=True)
-        
-        # Verify we have the required credentials
         print(f"[INFO] API_BASE_URL: {self.api_base_url}", file=sys.stderr)
         print(f"[INFO] API_KEY length: {len(self.api_key)}", file=sys.stderr)
         print(f"[INFO] MODEL_NAME: {self.model_name}", file=sys.stderr)
         
-        # Initialize OpenAI client with VALIDATOR'S credentials ONLY
-        try:
-            from openai import OpenAI
-            self.client = OpenAI(
-                api_key=api_key,
-                base_url=api_base_url,
-            )
-            print(f"[SUCCESS] OpenAI client initialized with validator credentials", file=sys.stderr)
-        except Exception as e:
-            print(f"[FATAL] Failed to initialize OpenAI client: {e}", file=sys.stderr)
-            raise
+        # Initialize logger (stdout only, per requirements)
+        self.logger = StructuredLogger(use_stdout=True)
+        
+        # Initialize OpenAI client if using LLM
+        if self.use_llm:
+            try:
+                from openai import OpenAI
+                # FIXED: Removed 'proxies' parameter - not supported in OpenAI v1.x
+                self.client = OpenAI(
+                    api_key=self.api_key,
+                    base_url=self.api_base_url,
+                )
+                print("[INFO] OpenAI client initialized successfully", file=sys.stderr)
+            except ImportError as e:
+                print(f"[ERROR] Failed to import OpenAI: {e}", file=sys.stderr)
+                self.use_llm = False
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize OpenAI client: {e}", file=sys.stderr)
+                self.use_llm = False
+        else:
+            self.client = None
         
         self.run_id = str(uuid.uuid4())
         self.results = {}
@@ -76,7 +90,6 @@ class InferenceRunner:
     ) -> Tuple[float, Dict[str, Any]]:
         """
         Run a single episode and return score.
-        Makes LLM API calls for every action decision.
         
         Args:
             difficulty: "easy", "medium", or "hard"
@@ -86,8 +99,6 @@ class InferenceRunner:
         Returns:
             Tuple of (score, info_dict)
         """
-        print(f"[EPISODE] Starting {difficulty} episode", file=sys.stderr)
-        
         # Create environment
         env = DisasterRescueEnv(difficulty=difficulty, seed=seed)
         
@@ -105,21 +116,19 @@ class InferenceRunner:
         # Reset environment
         obs, env_info = env.reset(seed=seed)
         
+        # Create agent (baseline for now)
+        agent = get_agent("greedy", env=env, seed=seed)
+        
         total_reward = 0.0
         step = 0
-        api_call_count = 0
         
-        # Episode loop - MAKE LLM API CALL FOR EVERY ACTION
-        print(f"[EPISODE] Beginning step loop...", file=sys.stderr)
+        # Episode loop
         while step < max_steps:
-            # CALL LLM FOR ACTION - THIS IS REQUIRED
-            try:
+            # Get action from agent or LLM
+            if self.use_llm:
                 action = self._get_llm_action(obs, difficulty, step, env_info)
-                api_call_count += 1
-                print(f"[API_CALL] #{api_call_count}: Action={action}", file=sys.stderr)
-            except Exception as e:
-                print(f"[FATAL] LLM API call failed at step {step}: {e}", file=sys.stderr)
-                raise
+            else:
+                action, _ = agent.predict(obs)
             
             # Step environment
             obs, reward, terminated, truncated, env_info = env.step(action)
@@ -139,10 +148,7 @@ class InferenceRunner:
             
             # Check termination
             if terminated or truncated:
-                print(f"[EPISODE] Episode terminated at step {step}", file=sys.stderr)
                 break
-        
-        print(f"[EPISODE] Completed with {api_call_count} API calls", file=sys.stderr)
         
         # Grade the episode
         grader = get_grader(difficulty)
@@ -156,7 +162,6 @@ class InferenceRunner:
             "steps": step,
             "total_reward": total_reward,
             "score": final_score,
-            "api_calls": api_call_count,
             "env_state": env.state(),
         }
         
@@ -170,7 +175,7 @@ class InferenceRunner:
         env_info: Dict[str, Any],
     ) -> int:
         """
-        Get action from LLM using validator's LiteLLM proxy.
+        Get action from LLM using OpenAI client.
         
         Args:
             obs: Current observation
@@ -181,35 +186,41 @@ class InferenceRunner:
         Returns:
             Action index (0-7)
         """
-        # Prepare prompt
-        prompt = self._prepare_llm_prompt(obs, difficulty, step, env_info)
+        if not self.use_llm or self.client is None:
+            # Fallback to random
+            return np.random.randint(0, 8)
         
-        # DEBUG: Show we're using the correct endpoint
-        print(f"[DEBUG] API endpoint: {self.api_base_url}", file=sys.stderr)
-        print(f"[DEBUG] Model: {self.model_name}", file=sys.stderr)
+        try:
+            # Prepare prompt
+            prompt = self._prepare_llm_prompt(obs, difficulty, step, env_info)
+            
+            # Call LLM
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an AI controlling an autonomous drone in a disaster rescue simulation. "
+                                   "Choose the best action given the current state. "
+                                   "Respond with a single number 0-7.",
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                max_tokens=10,
+                temperature=0.7,
+            )
+            
+            # Parse response
+            action_str = response.choices[0].message.content.strip()
+            action = int(action_str)
+            return np.clip(action, 0, 7)
         
-        # MAKE API CALL to validator's LiteLLM proxy
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an autonomous drone controller in a disaster rescue simulation. "
-                               "Respond with ONLY a single number 0-7.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            max_tokens=5,
-            temperature=0.7,
-        )
-        
-        # Parse response
-        action_str = response.choices[0].message.content.strip()
-        action = int(action_str)
-        return np.clip(action, 0, 7)
+        except Exception as e:
+            print(f"[ERROR] LLM call failed: {e}", file=sys.stderr)
+            return np.random.randint(0, 8)
     
     def _prepare_llm_prompt(
         self,
@@ -220,37 +231,41 @@ class InferenceRunner:
     ) -> str:
         """
         Prepare prompt for LLM.
-        """
-        battery = env_info.get('battery', 0)
-        victims_rescued = env_info.get('victims_rescued', 0)
-        total_victims = env_info.get('total_victims', 5)
-        hazards_nearby = np.sum(obs[:,:,2]) > 0 if len(obs.shape) > 2 and obs.shape[2] > 2 else False
-        victims_visible = np.sum(obs[:,:,1]) > 0 if len(obs.shape) > 2 and obs.shape[2] > 1 else False
         
-        prompt = f"""Disaster Rescue Simulation
+        Args:
+            obs: Current observation
+            difficulty: Task difficulty
+            step: Current step
+            env_info: Environment info
+        
+        Returns:
+            Formatted prompt string
+        """
+        prompt = f"""
+Disaster Rescue Simulation - Step {step}
 Difficulty: {difficulty}
-Step: {step}
 
 Current Status:
-Battery: {battery}
-Victims Rescued: {victims_rescued}/{total_victims}
+- Battery: {env_info.get('battery', 'Unknown')}
+- Victims Rescued: {env_info.get('victims_rescued', 0)}/{env_info.get('total_victims', 1)}
 
-Actions:
-0=North, 1=Northeast, 2=East, 3=Southeast
-4=South, 5=Southwest, 6=West, 7=Northwest
+Available Actions:
+0: North, 1: Northeast, 2: East, 3: Southeast
+4: South, 5: Southwest, 6: West, 7: Northwest
 
-Situation:
-Victims Visible: {victims_visible}
-Hazards Nearby: {hazards_nearby}
+Observation Summary:
+- Victims visible: {np.sum(obs[:,:,1]) > 0}
+- Hazards nearby: {np.sum(obs[:,:,2]) > 0}
+- Resources available: {np.sum(obs[:,:,3]) > 0}
+- Battery low: {env_info.get('battery', 100) < 200}
 
-Choose action (0-7):"""
-        
+What action should the drone take? (respond with single number 0-7)
+"""
         return prompt
     
     def run_all_tasks(self, seed: Optional[int] = None) -> Dict[str, float]:
         """
         Run all three difficulty levels sequentially.
-        Each action makes an API call to validator's LiteLLM proxy.
         
         Args:
             seed: Random seed for reproducibility
@@ -260,16 +275,10 @@ Choose action (0-7):"""
         """
         results = {}
         
-        print("[INFO] ========================================", file=sys.stderr)
-        print("[INFO] STARTING INFERENCE", file=sys.stderr)
-        print(f"[INFO] Using LiteLLM proxy: {self.api_base_url}", file=sys.stderr)
-        print(f"[INFO] Model: {self.model_name}", file=sys.stderr)
-        print("[INFO] ========================================", file=sys.stderr)
+        print("[INFO] Starting inference on all tasks...", file=sys.stderr)
         
         for difficulty in get_all_difficulties():
-            print(f"[INFO] ========================================", file=sys.stderr)
-            print(f"[INFO] DIFFICULTY: {difficulty.upper()}", file=sys.stderr)
-            print(f"[INFO] ========================================", file=sys.stderr)
+            print(f"[INFO] Running {difficulty} task...", file=sys.stderr)
             
             try:
                 score, info = self.run_episode(
@@ -277,22 +286,24 @@ Choose action (0-7):"""
                     seed=seed,
                 )
                 results[difficulty] = score
-                api_calls = info.get('api_calls', 0)
                 print(
-                    f"[RESULT] {difficulty.upper()}: Score={score:.4f}, API_Calls={api_calls}",
+                    f"[INFO] {difficulty.upper()} task completed. Score: {score:.4f}",
                     file=sys.stderr,
                 )
             except Exception as e:
-                print(f"[FATAL] {difficulty.upper()} FAILED: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                raise
+                print(f"[ERROR] {difficulty} task failed: {e}", file=sys.stderr)
+                results[difficulty] = 0.0
         
         self.results = results
         return results
     
     def get_summary(self) -> Dict[str, Any]:
-        """Get summary of all runs."""
+        """
+        Get summary of all runs.
+        
+        Returns:
+            Summary dictionary
+        """
         if not self.results:
             return {"error": "No results yet"}
         
@@ -300,7 +311,6 @@ Choose action (0-7):"""
         return {
             "run_id": self.run_id,
             "model": self.model_name,
-            "api_base_url": self.api_base_url,
             "results": self.results,
             "mean_score": float(np.mean(scores)) if scores else 0.0,
             "min_score": float(np.min(scores)) if scores else 0.0,
@@ -312,35 +322,30 @@ def main():
     """
     Main entry point for inference.
     
-    REQUIRED Environment Variables (provided by validator):
-    - API_BASE_URL: LiteLLM proxy endpoint
-    - API_KEY: LiteLLM proxy API key
-    - MODEL_NAME: Model to use (optional, default: gpt-3.5-turbo)
-    
-    This script will ONLY use validator-provided credentials.
-    No fallbacks, no defaults for API_BASE_URL and API_KEY.
+    Environment Variables:
+    - API_BASE_URL: OpenAI API base URL
+    - API_KEY: OpenAI API key
+    - MODEL_NAME: Model name (default: gpt-3.5-turbo)
+    - USE_LLM: Whether to use LLM (default: False)
+    - SEED: Random seed (default: None)
     """
+    # Get configuration from environment
+    use_llm = os.getenv("USE_LLM", "false").lower() == "true"
+    seed = int(os.getenv("SEED", "0")) if os.getenv("SEED") else None
+    
     try:
-        print("[INFO] Starting inference...", file=sys.stderr)
-        
-        # Create runner - will fail if validator hasn't provided credentials
-        runner = InferenceRunner()
+        # Create runner
+        runner = InferenceRunner(use_llm=use_llm)
         
         # Run all tasks
-        results = runner.run_all_tasks()
+        results = runner.run_all_tasks(seed=seed)
         
-        # Print summary
+        # Print summary to stderr (stdout reserved for logs)
         summary = runner.get_summary()
-        print("[INFO] ========================================", file=sys.stderr)
-        print("[INFO] INFERENCE COMPLETE!", file=sys.stderr)
-        print("[INFO] ========================================", file=sys.stderr)
+        print("[INFO] Inference Complete!", file=sys.stderr)
         print(json.dumps(summary, indent=2), file=sys.stderr)
         
         return 0
-    
-    except KeyError as e:
-        print(f"[FATAL] Missing required environment variable: {e}", file=sys.stderr)
-        return 1
     except Exception as e:
         print(f"[FATAL] Inference failed: {e}", file=sys.stderr)
         import traceback
