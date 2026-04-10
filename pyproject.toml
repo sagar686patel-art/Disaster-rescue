@@ -7,17 +7,15 @@ name = "disaster-rescue-rl"
 version = "0.1.0"
 description = "A reinforcement learning project for disaster rescue operations."
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "Paarchi Patel", email = "parchipatel@example.com" }
 ]
 readme = "README.md"
 license = { text = "MIT" }
 keywords = ["reinforcement-learning", "disaster", "rescue"]
 homepage = "https://github.com/paarchipatel-ship-it/disaster-rescue-rl"
 repository = "https://github.com/paarchipatel-ship-it/disaster-rescue-rl"
-requires-python = ">=3.9,<3.12"
+requires-python = ">=3.9"
 dependencies = [
-    "requests>=2.25.1",
-    "pandas>=1.2.0",
     "gymnasium==0.28.1",
     "numpy>=1.21.0,<1.25.0",
     "stable-baselines3==2.0.0",
@@ -25,14 +23,18 @@ dependencies = [
     "fastapi==0.104.1",
     "uvicorn[standard]==0.24.0",
     "pydantic==2.5.0",
-    "openai==1.6.1",
+    "openai>=2.7.2",
+    "requests==2.31.0",
     "gradio==4.17.0",
     "python-dotenv==1.0.0",
     "pyyaml==6.0.1",
     "opencv-python==4.8.1.78",
     "Pillow==10.1.0",
-    "tqdm==4.66.1"
+    "tqdm==4.66.1",
 ]
 
 [project.scripts]
-server = "app:main"
+server = "server.app:main"
+
+[tool.setuptools]
+packages = ["environment", "agents", "utils", "configs", "server"]
